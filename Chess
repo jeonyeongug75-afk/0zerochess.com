@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8" />
+    <title>통합 체스 플랫폼</title>
+
+    <link rel="stylesheet" href="style.css">
+
+    <!-- Chessboard UI -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.min.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.12.0/chess.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.min.js"></script>
+
+    <style>
+        body { display:flex; gap:40px; margin:40px; font-family:Arial; }
+        #eval-container { width:40px; height:480px; background:#333; position:relative; }
+        #eval-bar { position:absolute; width:100%; height:50%; background:white; bottom:0; }
+        #controls button { margin-bottom:10px; padding:10px; width:180px; }
+    </style>
+</head>
+<body>
+
+<div>
+    <h3>유저 시스템</h3>
+    <div id="user-info"></div>
+
+    <!-- LOGIN -->
+    <div id="login-box">
+        <h3>로그인</h3>
+        <input id="login-user" placeholder="아이디"><br>
+        <input id="login-pass" type="password" placeholder="비밀번호"><br><br>
+        <button onclick="login()">로그인</button>
+    </div>
+
+    <!-- SIGN UP -->
+    <div id="signup-box">
+        <h3>회원가입</h3>
+        <input id="signup-user" placeholder="아이디"><br>
+        <input id="signup-pass" type="password" placeholder="비밀번호"><br><br>
+        <button onclick="signup()">가입</button>
+    </div>
+
+    <button onclick="logout()">로그아웃</button>
+
+    <hr>
+
+    <h3>게임 모드</h3>
+    <div id="controls">
+        <button onclick="startHumanAI()">사람 vs AI</button>
+        <button onclick="startAiVsAi()">AI vs AI</button>
+        <button id="online-btn" onclick="startOnline()" disabled>온라인 멀티플레이</button>
+    </div>
+
+    <div id="status"></div>
+</div>
+
+<!-- CHESSBOARD -->
+<div id="board" style="width:480px;"></div>
+
+<!-- EVALUATION BAR -->
+<div id="eval-container">
+    <div id="eval-bar"></div>
+</div>
+
+<!-- STOCKFISH AI ENGINE -->
+<script>
+const stockfish = new Worker("https://cdn.jsdelivr.net/gh/niklasf/stockfish/src/stockfish.js");
+
+function getBestMove(fen, callback) {
+    stockfish.onmessage = e => {
+        if (typeof e.data === "string" && e.data.includes("bestmove")) {
+            callback(e.data.split(" ")[1]);
+        }
+    };
+
+    stockfish.postMessage("position fen " + fen);
+    stockfish.postMessage("go depth 15");
+}
+
+// 평가 바 업데이트
+stockfish.onmessage = e => {
+    if (typeof e.data !== "string") return;
+    if (!e.data.includes("score")) return;
+
+    const match = e.data.match(/score (cp|mate) (-?\d+)/);
+    if (!match) return;
+
+    let value = parseInt(match[2]);
+    if (match[1] === "mate") value = value > 0 ? 9999 : -9999;
+
+    const percent = (value + 9999) / 19998 * 100;
+    document.getElementById("eval-bar").style.height = percent + "%";
+};
+</script>
+
+<!-- FULL GAME LOGIC -->
+<script>
+let game = new Chess();
+let board = null;
+let mode = "local";
+let ws = null;
+let myColor = null;
+
+// UI 갱신
+function updateStatus() {
+    let status = game.turn() === "w" ? "백차례" : "흑차례";
+    if (game.in_check()) status += " (체크)";
+    if (game.in_checkmate()) status = "체크메이트!";
+    document.getElementById("status").innerText = status;
+}
+
+function onDragStart(source, piece) {
+    if (game.game_over()) return false;
+
+    // 온라인 모드에서 자신 차례가 아닐 때 불가
+    if (mode === "online") {
+        if ((myColor === "white" && piece.startsWith("b")) ||
+            (myColor === "black" && piece.startsWith("w"))) return false;
+    }
+}
+
+function onDrop(source, target) {
+    const move = game.move({ from: source, to: target, promotion: "q" });
+    if (!move) return "snapback";
+
+    updateStatus();
+
+    if (mode === "human-ai") {
+        setTimeout(() => {
+            getBestMove(game.fen(), best => {
+                game.move(best);
+                board.position(game.fen());
+                updateStatus();
+            });
+        }, 300);
+    }
+
+    if (mode === "online") {
+        ws.send(JSON.stringify({ type: "move", move }));
+    }
+}
+
+function initBoard() {
+    game.reset();
+    board = Chessboard("board", {
+        position: "start",
+        draggable: true,
+        onDragStart,
+        onDrop,
+        onSnapEnd: () => board.position(game.fen())
+    });
+    updateStatus();
+}
+
+// ------------- 게임 모드 -----------------
+
+function startHumanAI() {
+    mode = "human-ai";
+    initBoard();
+}
+
+function startAiVsAi() {
+    mode = "ai-ai";
+    initBoard();
+
+    const loop = () => {
+        if (game.game_over()) return;
+        getBestMove(game.fen(), best => {
+            game.move(best);
+            board.position(game.fen());
+            updateStatus();
+            setTimeout(loop, 300);
+        });
+    };
+
+    loop();
+}
+
+function startOnline() {
+    mode = "online";
+    initBoard();
+
+    ws = new WebSocket("wss://" + window.location.host);
+
+    ws.onmessage = e => {
+        const data = JSON.parse(e.data);
+
+        if (data.type === "waiting") {
+            document.getElementById("status").innerText = "상대 찾는 중…";
+        }
+
+        if (data.type === "start") {
+            myColor = data.color;
+            board.orientation(myColor);
+            alert("상대: " + data.opponent);
+        }
+
+        if (data.type === "move") {
+            game.move(data.move);
+            board.position(game.fen());
+        }
+
+        if (data.type === "end") {
+            alert("상대가 게임을 떠났습니다.");
+        }
+    };
+}
+
+// ------------- 로그인 / 회원가입 -----------------
+
+async function signup() {
+    const username = document.getElementById("signup-user").value;
+    const password = document.getElementById("signup-pass").value;
+
+    const result = await fetch("/signup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password })
+    }).then(r => r.json());
+
+    alert(result.success ? "가입 성공!" : "가입 실패: " + result.msg);
+}
+
+async function login() {
+    const username = document.getElementById("login-user").value;
+    const password = document.getElementById("login-pass").value;
+
+    const result = await fetch("/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password })
+    }).then(r => r.json());
+
+    if (result.success) {
+        document.getElementById("user-info").innerText =
+            "로그인됨: " + result.username;
+
+        document.getElementById("online-btn").disabled = false;
+        document.getElementById("login-box").style.display = "none";
+        document.getElementById("signup-box").style.display = "none";
+    } else {
+        alert(result.msg);
+    }
+}
+
+async function logout() {
+    await fetch("/logout", { method: "POST" });
+    location.reload();
+}
+
+// ------------- 초기 로그인 상태 확인 -----------------
+
+fetch("/me")
+    .then(r => r.json())
+    .then(data => {
+        if (data.loggedIn) {
+            document.getElementById("user-info").innerText =
+                "로그인됨: " + data.username;
+
+            document.getElementById("online-btn").disabled = false;
+            document.getElementById("login-box").style.display = "none";
+            document.getElementById("signup-box").style.display = "none";
+        }
+    });
+
+// ----------- 초기 체스판 실행 -----------
+initBoard();
+</script>
+
+</body>
+</html>
